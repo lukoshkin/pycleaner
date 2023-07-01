@@ -12,10 +12,15 @@ TODO: Take into account the possibility of site-package paths being modified.
 """
 import importlib.util
 import logging
+from collections import defaultdict
+from importlib.machinery import ModuleSpec
+from tree_sitter import Node
 from pathlib import Path
 
+from . import utils
 
-def dot_parent_stem_split(name: str):
+
+def dot_parent_stem_split(name: str) -> (str, str):
     """
     Return parent and name of a file given as the string `name`.
     """
@@ -24,7 +29,7 @@ def dot_parent_stem_split(name: str):
     return prefix, name
 
 
-def dotted_name_spec(dotted_name: str, silent=False):
+def dotted_name_spec(dotted_name: str, silent=False) -> ModuleSpec | None:
     """
     Return a spec of the module given as `dotted_name`.
     If `silent` is True, dismiss warnings.
@@ -52,30 +57,37 @@ class PyProjectDeps:
       parser - Python tree-sitter parser
       target_files - core project py-files
       project_dir - Python project directory
+      deep_walk - whether to search all import statements, even indented ones.
+                  Default: False. Deep exploration will require much more time.
     """
 
-    def __init__(self, parser, target_files: str, project_dir: str):
+    def __init__(
+        self,
+        parser,
+        target_files: str,
+        project_dir: str,
+        deep_walk: bool = False,
+    ):
         self.parser = parser
+        self.deep_walk = deep_walk
         self.target_files = target_files
         self.cwd = Path(project_dir).resolve()
         assert (
             self.cwd.is_dir()
         ), f"Check --project='{self.cwd}' exists and is a directory"
 
-        ## `simple_imports` and `from_imports` are currently local to
-        ## `module_paths` and `file_imports` methods. However, one can
-        ## make them the class attributes.
-        # self.simple_imports = []
-        # self.from_imports = []
-
-        self.not_found = []
-        self.may_found = []
+        self.not_found = defaultdict(set)
+        self.may_found = defaultdict(set)
 
         self.core_files = [str(x) for x in self.add_targets(target_files)]
         self.wd_files = {str(x) for x in self.cwd.rglob("*.py")}
+
+        self._simple_imports = []
+        self._from_imports = []
+        self._currently_inspected = None
         self._scripts = {}
 
-    def recursive_call(self):
+    def recursive_call(self) -> (list[str], list[str]):
         """
         Check imports of the core files (target_files).
         If there are local python libraries imported continue to
@@ -86,8 +98,15 @@ class PyProjectDeps:
         for x in self.core_files:
             self._scripts.remove(x)
 
+        ## Though `seen` set is not strictly necessary, it helps
+        ## to get rid of redundant `module_paths` calls.
+        seen = set()
         while len(self._lifo_queue) > 0:
             filename = self._lifo_queue.pop()
+            if filename in seen:
+                continue
+
+            seen.add(filename)
             for path in self.module_paths(filename):
                 if path in self._scripts:
                     self._lifo_queue.append(path)
@@ -95,10 +114,12 @@ class PyProjectDeps:
                     libs.append(path)
 
         scripts = []
-        add_flag = True
         for path in self._scripts:
+            add_flag = True
             for miss in self.not_found:
-                if miss.lstrip(".") in path:
+                miss = miss.lstrip(".").split(".")
+                path_set = path.removesuffix(".py").split("/")
+                if utils.is_sublist(miss, path_set):
                     add_flag = False
                     break
 
@@ -107,7 +128,7 @@ class PyProjectDeps:
 
         return libs, scripts
 
-    def non_recursive_call(self):
+    def non_recursive_call(self) -> (list[str], list[str]):
         """
         Check only imports of the core files (target_files).
         Not sure about this method's use cases.
@@ -126,53 +147,71 @@ class PyProjectDeps:
                 scripts.append(name)
         return libs, scripts
 
-    def add_targets(self, path):
+    def add_targets(self, paths: str | list[str]) -> list[Path]:
         """
         Add the core project files to a LIFO queue - `self._lifo_queue`.
         """
-        p = self.cwd / path
-        assert p.exists(), f"Not found --target='{path}'"
-        self._lifo_queue = list(p.glob("*.py")) if p.is_dir() else [p]
+        paths = paths if isinstance(paths, list) else [paths]
+        assert not utils.contains_prefix(paths), (
+            "Some of the specified target folders contain other"
+            " target folders or files, or targets are specified repeatedly."
+        )
+        self._lifo_queue = []
+        for path in paths:
+            self._lifo_queue.extend(self._add_targets(path))
+
         return self._lifo_queue.copy()
 
-    def raw_import_lines(self, filename):
+    def _add_targets(self, path: str) -> list[Path]:
+        p = self.cwd / path
+        assert p.exists(), f"Not found --target='{path}'"
+        targets = list(p.rglob("*.py")) if p.is_dir() else [p]
+        return targets
+
+    def module_paths(self, filename: str | Path) -> list[str]:
         """
-        Parse file `filename` with `self.parser`.
+        Return absolute paths to py-files that are direct and indirect
+        dependencies of the core project files. If a path cannot be
+        extracted, then its dotted name or parent thereof is added to
+        `self.not_found` dict.
+
+        Takes Path, can work with str.
+        """
+        self._currently_inspected = str(filename)
+        import_lines = self._raw_import_lines(filename)
+        self.file_imports(import_lines)
+
+        paths = []
+        for modules in self._simple_imports:
+            self._parse_raw_modules(modules, paths)
+
+        for modules in self._from_imports:
+            self._parse_raw_modules(modules[1:], paths, modules[0])
+
+        self._currently_inspected = None
+        return paths
+
+    def _raw_import_lines(self, filename: str | Path) -> list[Node]:
+        """
+        Takes Path, can work with str.
         """
         with open(filename, "rb") as fd:
             tree = self.parser.parse(fd.read())
             return tree.root_node.children
 
-    def module_paths(self, filename):
-        """
-        Return absolute paths to py-files that are direct and indirect
-        dependencies of the core project files. If a path cannot be
-        extracted, then its dotted name or parent thereof is added to
-        `self.not_found` list.
-        """
-        import_lines = self.raw_import_lines(filename)
-        simple_imports, from_imports = self.file_imports(import_lines)
-
-        paths = []
-        for modules in simple_imports:
-            self._parse_raw_modules(modules, paths)
-
-        for modules in from_imports:
-            self._parse_raw_modules(modules[1:], paths, modules[0])
-
-        return paths
-
-    def _parse_raw_modules(self, modules, paths, prefix=None):
+    def _parse_raw_modules(
+        self, modules: list[str], paths: list[str], prefix: str = None
+    ):
         for m in modules:
             dn = m if prefix is None else f"{prefix}.{m}"
             name = self._module_path(m, prefix)
             if name in (dn, prefix):
-                self.not_found.append(name)
+                self.not_found[name].add(self._currently_inspected)
                 continue
 
             paths.append(name)
 
-    def _module_path(self, name, prefix=None):
+    def _module_path(self, name: str, prefix: str = None) -> str:
         if prefix is None:
             dotted_name = name
             prefix, name = dot_parent_stem_split(name)
@@ -192,7 +231,7 @@ class PyProjectDeps:
 
         return f"{spec.origin}/__init__.py"
 
-    def similar_to_dotted_name(self, dotted_name):
+    def similar_to_dotted_name(self, dotted_name: str) -> str:
         """
         Try to find similar module, package to `dotted_name` or parent thereof.
         The `dotted_name` is first transformed to path suffix by trimming the
@@ -225,39 +264,44 @@ class PyProjectDeps:
         if len(similar) == 1:
             return str(next(iter(similar)))
 
-        self.may_found.extend(list(map(str, may_found)))
+        if len(may_found) > 0:
+            key = (dotted_name, self._currently_inspected)
+            self.may_found[key].update(map(str, may_found))
+
         return dotted_name
 
-    def file_imports(self, import_lines):
+    def file_imports(self, import_lines: list[Node]):
         """
         Process parsed import statements `import lines`, split it into
         imports starting from keywords `import` (`simple_imports`) and
         `from` (`from_imports`).
         """
-        simple_imports = []
-        from_imports = []
-
         for node in import_lines:
-            if node.type in ["import_statement", "import_from_statement"]:
-                self._extract_imports(node, simple_imports, from_imports)
+            self._node_walk_collect(node)
 
-        return simple_imports, from_imports
+    def _node_walk_collect(self, node: Node):
+        if node.type in ["import_statement", "import_from_statement"]:
+            self._extract_imports(node)
 
-    def _extract_imports(self, node, simple_imports, from_imports):
+        if self.deep_walk:
+            for child in node.children:
+                self._node_walk_collect(child)
+
+    def _extract_imports(self, node: Node):
         import_type = node.children[0].type
         content = []
 
         if import_type == "from":
             content.append(node.children[1].text.decode("ascii"))
             content.extend(self._unalias(node.children[3:]))
-            from_imports.append(content)
+            self._from_imports.append(content)
         elif import_type == "import":
             content.extend(self._unalias(node.children[1:]))
-            simple_imports.append(content)
+            self._simple_imports.append(content)
         else:
             raise ValueError("Unknown import type")
 
-    def _unalias(self, imports):
+    def _unalias(self, imports: list[Node]) -> list[str]:
         texts = []
         for node in imports:
             text = node.text.decode("ascii")

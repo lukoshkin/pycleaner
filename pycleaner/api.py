@@ -21,9 +21,38 @@ def _parsed_args():
         "--target",
         default="core",
         help=(
-            "Project core files. The file or directory with the core files"
-            " should reside within the project directory ('--project')"
+            "Project core files. The files or/and directories with the core"
+            " files should reside within the project directory ('--project')."
+            " Multiple targets should separated by a comma."
         ),
+    )
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        default=False,
+        help="Search all imports, even indented",
+    )
+    parser.add_argument(
+        "--abs-path",
+        action="store_true",
+        default=False,
+        help="Instead of relative paths show absolute",
+    )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        default=False,
+        help=(
+            "Log scripts to pycleaner-scripts.log and libs to"
+            " pycleaner-libs.log. Log-files are created in the current folder."
+        ),
+    )
+    parser.add_argument(
+        "-z",
+        "--zip-lib",
+        dest="zip",
+        default=None,
+        help="Zip dependencies for further migration",
     )
     parser.add_argument(
         "--rm-scripts",
@@ -31,12 +60,6 @@ def _parsed_args():
         dest="rm",
         default=False,
         help="Remove all scripts",
-    )
-    parser.add_argument(
-        "--abs-path",
-        action="store_true",
-        default=False,
-        help="Instead of relative paths show absolute",
     )
     parser.add_argument(
         "-1",
@@ -84,34 +107,60 @@ def api_call():
     just scripts (either ancillary files in the project or redundant).
     """
     args = _parsed_args()
-    rel = not args.abs_path
+    if args.rm and args.zip is not None:
+        raise ValueError(
+            "It is not supposed --rm-scripts and --zip-lib"
+            " options are used simultaneously"
+        )
     parser = utils.python_parser()
     sorter = lib_script_split.PyProjectDeps(
         parser,
         project_dir=args.project,
-        target_files=args.target,
+        target_files=args.target.split(","),
+        deep_walk=args.deep,
     )
     cli = cmd.Cmd()
-    width = os.get_terminal_size().columns
-    libs, scripts = sorter.recursive_call()
+    try:
+        width = os.get_terminal_size().columns
+    except OSError:
+        width = 120
+        ## Falling back to 120 in case
+        ## a user redirects stdout to a file.
 
+    libs, scripts = sorter.recursive_call()
     if not any([args.libs, args.scripts, args.not_found, args.may_found]):
         args.libs = args.scripts = args.not_found = args.may_found = True
 
-    def block(file_list, header, show=False):
+    def block(files, header, show=False):
         if show:
             print(header.upper())
-            cli.columnize(file_list, width)
+            cli.columnize(files, width)
             print()
 
-    block(utils.rel_paths(libs, sorter.cwd, rel), "libraries", args.libs)
-    block(utils.rel_paths(scripts, sorter.cwd, rel), "scripts", args.scripts)
-    block(sorter.may_found, "might be found", args.may_found)
-    block(sorter.not_found, "not found", args.not_found)
+    rel = None if args.abs_path else sorter.cwd
+    block(utils.rel_paths(libs, rel), "libraries", args.libs)
+    block(utils.rel_paths(scripts, rel), "scripts", args.scripts)
+    block(
+        utils.may_found_dict_to_list(sorter.may_found, rel),
+        "might be found",
+        args.may_found,
+    )
+    block(
+        utils.not_found_dict_to_list(sorter.not_found, rel),
+        "not found",
+        args.not_found,
+    )
     print(
         f"There are {len(libs)} files that can be considered as libraries,"
         f" and {len(scripts)} ─ as scripts"
     )
+    if args.log:
+        log_files = utils.rel_paths(libs, rel)
+        utils.file_list_log(log_files, "pycleaner-libs.log")
+        log_files = utils.rel_paths(scripts, rel)
+        utils.file_list_log(log_files, "pycleaner-scripts.log")
+    if args.zip is not None:
+        utils.file_list_zip(libs, args.zip)
     if args.rm:
         if _user_permits(
             "Are you sure you want to proceed with removal of all the scripts?"

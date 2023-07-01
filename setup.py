@@ -38,7 +38,7 @@ class CustomInstall(install):
 
 setup(
     name=PIP_ALLOWED_NAME,
-    version="1.0.1",
+    version="1.0.2",
     author="lukoshkin",
     author_email="lukoshkin.workspace@gmail.com",
     description=(
